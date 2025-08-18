@@ -13,19 +13,77 @@
 # limitations under the License.
 import logging
 import random
-
+import sys
+import librosa
+import numpy as np
 import pyarrow.parquet as pq
 from io import BytesIO
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
-import pyworld as pw
-
+import os
+import pyworld as pw  
+from cosyvoice.utils.file_utils import load_wav
+torchaudio.set_audio_backend('soundfile')
 
 AUDIO_FORMAT_SETS = {'flac', 'mp3', 'm4a', 'ogg', 'opus', 'wav', 'wma'}
 
+import struct
+from protos.text_data_pb2 import TextData
+def pb_opener(data, mode='train', tts_data={}):
+    """ Give url or local file, return file descriptor
+        Inplace operation.
 
+        Args:
+            data(Iterable[str]): url or local file list
+
+        Returns:
+            Iterable[{src, stream}]
+    """
+    for sample in data:
+        assert 'src' in sample
+        url = sample['src']
+        try:
+            with open(url, 'rb') as f:
+                while True:
+                    d = f.read(4)
+                    if len(d) != 4:
+                        break
+                    length = struct.unpack('I', d)[0]
+                    data = f.read(length)
+                    text_data = TextData()
+                    text_data.ParseFromString(data)
+                    samples = list(text_data.sentences)
+                    random.shuffle(samples)
+                    for sentence in samples:
+                        
+                        sample["utt"] = sentence.file_path
+                        sample["wav"] = sentence.file_path
+                        try:
+                            if os.path.isfile(sentence.file_path):
+                                pass
+                            else:
+                                sentence.file_path = sentence.file_path.replace('/wavs/', '/wavs_concat_6s/')
+                            #wavs_concat_6s
+                            with open(sentence.file_path, 'rb') as af:
+                                sample["audio_data"] = af.read()
+                        except Exception as ex:
+                            #logging.warning('read file {} failed, ex info {}'.format(sentence.file_path, ex))
+                            continue
+                        sample["text"] = sentence.text
+                        sample["spk"] = text_data.name
+                        sample["utt_embedding"] = list(sentence.emb)
+                        sample["spk_embedding"] = list(sentence.emb)
+                        sample["speech_token"] = list(sentence.semantics)
+                        sample["wav_path"] = str(sentence.file_path)
+                        yield {**sample}
+
+        except Exception as ex:
+            logging.warning('Failed to open {}, ex info {}'.format(url, ex))
+
+           
+        
 def parquet_opener(data, mode='train', tts_data={}):
     """ Give url or local file, return file descriptor
         Inplace operation.
@@ -43,6 +101,8 @@ def parquet_opener(data, mode='train', tts_data={}):
             for df in pq.ParquetFile(url).iter_batches(batch_size=64):
                 df = df.to_pandas()
                 for i in range(len(df)):
+                    if mode == 'inference' and df.loc[i, 'utt'] not in tts_data:
+                        continue
                     sample.update(dict(df.loc[i]))
                     if mode == 'train':
                         # NOTE do not return sample directly, must initialize a new dict
@@ -98,8 +158,6 @@ def filter(data,
             continue
         if len(sample['speech_token']) == 0:
             continue
-        if 'reject_speech_token' in sample and len(sample['reject_speech_token']) == 0:
-            continue
         if num_frames != 0:
             if len(sample['text_token']) / num_frames < min_output_input_ratio:
                 continue
@@ -151,15 +209,17 @@ def truncate(data, truncate_length=24576, mode='train'):
         if waveform.shape[1] > truncate_length:
             start = random.randint(0, waveform.shape[1] - truncate_length)
             waveform = waveform[:, start: start + truncate_length]
+            sample['truncate_st'] = start
         else:
             waveform = torch.concat([waveform, torch.zeros(1, truncate_length - waveform.shape[1])], dim=1)
+            sample['truncate_st'] = 0
         sample['speech'] = waveform
+        
         yield sample
 
-
-def compute_fbank(data,
+def compute_fbank_truncate(data,
                   feat_extractor,
-                  token_mel_ratio=0,
+                  token_mel_ratio=2,
                   mode='train'):
     """ Extract fbank
 
@@ -170,20 +230,110 @@ def compute_fbank(data,
             Iterable[{key, feat, label}]
     """
     for sample in data:
+        #print('===================compute_fbank_truncate sample===================')
+        # for key in sample:
+        #     print(key)
+        # sys.exit()
         assert 'sample_rate' in sample
         assert 'speech' in sample
         assert 'utt' in sample
         assert 'text_token' in sample
         waveform = sample['speech']
-        feat = feat_extractor(waveform).squeeze(dim=0).transpose(0, 1)
-        if token_mel_ratio != 0:
-            # trim to align speech_token and speech_feat
-            token_len = int(min(feat.shape[0] / token_mel_ratio, sample["speech_token"].shape[0]))
-            feat = feat[:token_mel_ratio * token_len]
-            sample["speech_token"] = sample["speech_token"][:token_len]
-        sample['speech_feat'] = feat
+        mat = feat_extractor(waveform).squeeze(dim=0).transpose(0, 1)
+        #print('feat_extractor mel', mat.shape)
+        #print('speech_token 25hz', len(sample['speech_token']))
+
+        sample['speech_feat'] = mat
+        #print('wavform ', sample['speech'].shape)
+        #print('speech_feat ', sample['speech_feat'].shape)
+
         yield sample
 
+        
+def compute_fbank(data,
+                  feat_extractor,
+                  token_mel_ratio=2,
+                  mode='train'):
+    """ Extract fbank
+
+        Args:
+            data: Iterable[{key, wav, label, sample_rate}]
+
+        Returns:
+            Iterable[{key, feat, label}]
+    """
+    for sample in data:
+        #print('===================compute_fbank sample===================')
+        # for key in sample:
+        #     print(key)
+        # sys.exit()
+        assert 'sample_rate' in sample
+        assert 'speech' in sample
+        assert 'utt' in sample
+        assert 'text_token' in sample
+        waveform = sample['speech']
+        mat = feat_extractor(waveform).squeeze(dim=0).transpose(0, 1)
+        #print('feat_extractor mel', mat.shape)
+        #print('speech_token 25hz', len(sample['speech_token']))
+
+        #speech_feat torch.Size([861, 160])
+        #speech_token 432
+        # cosy2: 
+        speech_token_len = len(sample['speech_token'])
+        mat_len = speech_token_len * token_mel_ratio
+        #print('orignal speech_token_len', speech_token_len)
+        #print('orignal speech_feat', mat.shape)
+        
+        if mat_len > mat.size(0):
+            pad_mel_len = speech_token_len * token_mel_ratio - mat.size()[0]
+            #print('pad_mel_len', pad_mel_len)
+        
+            # 获取最后一个元素作为 padding 值
+            padding_value = mat[-1, :].unsqueeze(0).expand(pad_mel_len, -1)  # 将最后一行复制三次
+
+            # 直接拼接到原始 tensor 上
+            new_mat = torch.cat((mat, padding_value), dim=0)
+        else:
+            # mat: [T,80]
+            new_mat = mat[:mat_len, :]
+            #print('compute_fbank', new_mat.size())
+        #print('speech_feat mat', mat.size(), 'pad_mel_len', pad_mel_len, 'speech_token_len', speech_token_len, 'new_mat', new_mat.size())
+        #print('speech_feat new_mat', new_mat.size())
+        #print('speech_token', len(sample['speech_token']))
+        #sys.exit()
+        sample['speech_feat'] = new_mat
+        #save_path = os.path.join('01', os.path.basename(sample["wav_path"]).replace('.wav', '.npy'))
+        #np.save(save_path, mat.cpu().numpy())
+        #print('=================== wav_path', sample["wav_path"])
+        #print('length same process mel:', new_mat.shape)
+        #sys.exit()
+        #print('wavform ', sample['speech'].shape)
+        #print('speech_feat ', sample['speech_feat'].shape)
+        yield sample
+
+
+# def compute_f0(data, pitch_extractor, mode='train'):
+#     """ Extract f0
+
+#         Args:
+#             data: Iterable[{key, wav, label, sample_rate}]
+
+#         Returns:
+#             Iterable[{key, feat, label}]
+#     """
+#     for sample in data:
+#         print('===================compute_f0 sample===================')
+#         for key in sample:
+#             print(key)
+#         # assert 'sample_rate' in sample
+#         # assert 'speech' in sample
+#         # assert 'utt' in sample
+#         # assert 'text_token' in sample
+#         waveform = sample['speech']
+#         mat = pitch_extractor(waveform).transpose(1, 2)
+#         mat = F.interpolate(mat, size=sample['speech_feat'].shape[0], mode='linear')
+#         sample['pitch_feat'] = mat[0, 0]
+#         yield sample
 
 def compute_f0(data, sample_rate, hop_size, mode='train'):
     """ Extract f0
@@ -200,15 +350,52 @@ def compute_f0(data, sample_rate, hop_size, mode='train'):
         assert 'speech' in sample
         assert 'utt' in sample
         assert 'text_token' in sample
-        waveform = sample['speech']
-        _f0, t = pw.harvest(waveform.squeeze(dim=0).numpy().astype('double'), sample_rate, frame_period=frame_period)
-        if sum(_f0 != 0) < 5:  # this happens when the algorithm fails
-            _f0, t = pw.dio(waveform.squeeze(dim=0).numpy().astype('double'), sample_rate, frame_period=frame_period)  # if harvest fails, try dio
-        f0 = pw.stonemask(waveform.squeeze(dim=0).numpy().astype('double'), _f0, t, sample_rate)
-        f0 = F.interpolate(torch.from_numpy(f0).view(1, 1, -1), size=sample['speech_feat'].shape[0], mode='linear').view(-1)
-        sample['pitch_feat'] = f0
-        yield sample
+        #waveform = sample['speech']
+        f0_basedir = '/mnt/nas1/zhangying/cosy_data_25hz/sft_data/f0_data'
+        f0_path = sample["wav_path"].replace('/mnt/nas1', f0_basedir).replace('.wav', '.npy')
+        # 不能预先存储，因为随机截取的wav 片段
+        
+        truncate_st = sample['truncate_st']
+        st_f0 = int(truncate_st/hop_size)
+        #et_f0 = int(truncate_et/hop_size)
+        f0_len = sample['speech_feat'].shape[0] 
+        et_f0 = st_f0+f0_len
+        try:
+            #print('f0_path', f0_path)
+            f0 = np.load(f0_path)
 
+
+        except: 
+            os.makedirs(os.path.dirname(f0_path), exist_ok=True)
+        #sample['truncate']
+            waveform = load_wav(sample["wav_path"], 24000)
+
+        
+            _f0, t = pw.harvest(waveform.squeeze(dim=0).numpy().astype('double'), sample_rate, frame_period=frame_period)
+            if sum(_f0 != 0) < 5: # this happens when the algorithm fails
+                _f0, t = pw.dio(waveform.squeeze(dim=0).numpy().astype('double'), sample_rate, frame_period=frame_period) # if harvest fails, try dio
+            f0 = pw.stonemask(waveform.squeeze(dim=0).numpy().astype('double'), _f0, t, sample_rate) # f0: len(wav)/hop_size
+            np.save(f0_path, f0)
+            
+        if len(f0) >= f0_len:
+            pass
+        else:
+            f0 = np.concatenate((f0, [0]*(f0_len-len(f0))), axis=0)
+
+        try:
+            f0_data = F.interpolate(torch.from_numpy(f0).view(1, 1, -1), size=f0_len, mode='linear').view(-1)
+        except: 
+            
+            
+            print(sample["wav_path"], len(f0_ori), st_f0, et_f0, 'slice_f0_len', f0_len, 'truncate_st:', truncate_st, 'hop_size:', hop_size)
+        sample['pitch_feat'] = f0_data
+        # print('=============compute_f0 sample_rate', sample['sample_rate'])
+        # print('hop_size', hop_size)
+        # print('=============compute_f0 speech', sample['speech'].shape)
+        # print('=============compute_f0 pitch_feat', f0.shape)
+        # print('=============compute_f0 speech_feat', sample['speech_feat'].shape)
+        yield sample
+        
 
 def parse_embedding(data, normalize, mode='train'):
     """ Parse utt_embedding/spk_embedding
@@ -242,6 +429,8 @@ def tokenize(data, get_tokenizer, allowed_special, mode='train'):
     for sample in data:
         assert 'text' in sample
         sample['text_token'] = tokenizer.encode(sample['text'], allowed_special=allowed_special)
+        if mode == 'inference':
+            sample['tts_text_token'] = tokenizer.encode(sample['tts_text'], allowed_special=allowed_special)
         yield sample
 
 
@@ -349,15 +538,18 @@ def dynamic_batch(data, max_frames_in_batch=12000, mode='train'):
 def batch(data, batch_type='static', batch_size=16, max_frames_in_batch=12000, mode='train'):
     """ Wrapper for static/dynamic batch
     """
-    if batch_type == 'static':
-        return static_batch(data, batch_size)
-    elif batch_type == 'dynamic':
-        return dynamic_batch(data, max_frames_in_batch)
+    if mode == 'inference':
+        return static_batch(data, 1)
     else:
-        logging.fatal('Unsupported batch type {}'.format(batch_type))
+        if batch_type == 'static':
+            return static_batch(data, batch_size)
+        elif batch_type == 'dynamic':
+            return dynamic_batch(data, max_frames_in_batch)
+        else:
+            logging.fatal('Unsupported batch type {}'.format(batch_type))
 
 
-def padding(data, use_spk_embedding, mode='train', gan=False, dpo=False):
+def padding(data, use_spk_embedding, mode='train', gan=False):
     """ Padding the data into training data
 
         Args:
@@ -383,9 +575,17 @@ def padding(data, use_spk_embedding, mode='train', gan=False, dpo=False):
                                     padding_value=0)
         speech_feat = [sample[i]['speech_feat'] for i in order]
         speech_feat_len = torch.tensor([i.size(0) for i in speech_feat], dtype=torch.int32)
+        
         speech_feat = pad_sequence(speech_feat,
-                                   batch_first=True,
-                                   padding_value=0)
+                                       batch_first=True,
+                                       padding_value=0)
+        #except:
+        #    original_lengths = [feat.size(0) for feat in speech_feat]
+        #    print("原始样本长度:", original_lengths)
+        #    original_dims = [feat.size(1) for feat in speech_feat]
+        #    print("填充后统一长度:", original_dims)
+
+            
         text = [sample[i]['text'] for i in order]
         text_token = [torch.tensor(sample[i]['text_token']) for i in order]
         text_token_len = torch.tensor([i.size(0) for i in text_token], dtype=torch.int32)
@@ -419,14 +619,16 @@ def padding(data, use_spk_embedding, mode='train', gan=False, dpo=False):
             # only gan train needs speech, delete it to save memory
             del batch["speech"]
             del batch["speech_len"]
-        if dpo is True:
-            reject_speech_token = [torch.tensor(sample[i]['reject_speech_token']) for i in order]
-            reject_speech_token_len = torch.tensor([i.size(0) for i in reject_speech_token], dtype=torch.int32)
-            reject_speech_token = pad_sequence(reject_speech_token,
-                                               batch_first=True,
-                                               padding_value=0)
-            batch['reject_speech_token'] = reject_speech_token
-            batch['reject_speech_token_len'] = reject_speech_token_len
+        if mode == 'inference':
+            tts_text = [sample[i]['tts_text'] for i in order]
+            tts_index = [sample[i]['tts_index'] for i in order]
+            tts_text_token = [torch.tensor(sample[i]['tts_text_token']) for i in order]
+            tts_text_token_len = torch.tensor([i.size(0) for i in tts_text_token], dtype=torch.int32)
+            tts_text_token = pad_sequence(tts_text_token, batch_first=True, padding_value=-1)
+            batch.update({'tts_text': tts_text,
+                          'tts_index': tts_index,
+                          'tts_text_token': tts_text_token,
+                          'tts_text_token_len': tts_text_token_len})
         if use_spk_embedding is True:
             batch["embedding"] = batch["spk_embedding"]
         else:
