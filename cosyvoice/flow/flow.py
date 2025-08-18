@@ -150,6 +150,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
 
 class CausalMaskedDiffWithXvec(torch.nn.Module):
     def __init__(self,
+                 streaming: bool=False,
                  input_size: int = 512,
                  output_size: int = 80,
                  spk_embed_dim: int = 192,
@@ -185,7 +186,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
         self.pre_lookahead_len = pre_lookahead_len
-
+        
+        self.streaming = streaming
     def forward(
             self,
             batch: dict,
@@ -198,8 +200,10 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         embedding = batch['embedding'].to(device)
 
         # NOTE unified training, static_chunk_size > 0 or = 0
-        streaming = True if random.random() < 0.5 else False
-
+        if self.streaming:
+            streaming = self.streaming if random.random() < 0.5 else False
+        else:
+            streaming = self.streaming
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
