@@ -130,6 +130,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         causal: bool = False,
         cnn_module_norm: str = "batch_norm",
         key_bias: bool = True,
+        token_mel_ratio: int = 1,
         gradient_checkpointing: bool = False,
     ):
         """
@@ -214,7 +215,9 @@ class UpsampleConformerEncoder(torch.nn.Module):
                 normalize_before,
             ) for _ in range(num_blocks)
         ])
-        self.up_layer = Upsample1D(channels=512, out_channels=512, stride=2)
+        #self.up_layer = Upsample1D(channels=512, out_channels=512, stride=2)
+        self.token_mel_ratio = token_mel_ratio
+        self.up_layer = Upsample1D(channels=512, out_channels=512, stride=token_mel_ratio)
         self.up_embed = COSYVOICE_SUBSAMPLE_CLASSES[input_layer](
             input_size,
             output_size,
@@ -282,7 +285,14 @@ class UpsampleConformerEncoder(torch.nn.Module):
             context_masks = torch.ones(1, 1, context.size(1)).to(masks)
             context, _, _ = self.embed(context, context_masks, offset=xs.size(1))
         mask_pad = masks  # (B, 1, T/subsample_rate)
-        chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size if streaming is True else 0, -1)
+        #chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size if streaming is True else 0, -1)
+        chunk_masks = add_optional_chunk_mask(xs, masks,
+                                              self.use_dynamic_chunk if streaming is True else False,
+                                              self.use_dynamic_left_chunk if streaming is True else False,
+                                              decoding_chunk_size if streaming is True else 0,
+                                              self.static_chunk_size if streaming is True else 0,
+                                              num_decoding_left_chunks if streaming is True else -1)
+
         # lookahead + conformer encoder
         xs = self.pre_lookahead_layer(xs, context=context)
         xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad)
@@ -295,7 +305,14 @@ class UpsampleConformerEncoder(torch.nn.Module):
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
         xs, pos_emb, masks = self.up_embed(xs, masks)
         mask_pad = masks  # (B, 1, T/subsample_rate)
-        chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size * self.up_layer.stride if streaming is True else 0, -1)
+        #chunk_masks = add_optional_chunk_mask(xs, masks, False, False, 0, self.static_chunk_size * self.up_layer.stride if streaming is True else 0, -1)
+        chunk_masks = add_optional_chunk_mask(xs, masks,
+                                              self.use_dynamic_chunk if streaming is True else False,
+                                              self.use_dynamic_left_chunk if streaming is True else False,
+                                              decoding_chunk_size if streaming is True else 0,
+                                              self.static_chunk_size if streaming is True else 0,
+                                              num_decoding_left_chunks if streaming is True else -1)
+
         xs = self.forward_up_layers(xs, chunk_masks, pos_emb, mask_pad)
 
         if self.normalize_before:
