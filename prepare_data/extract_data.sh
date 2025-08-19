@@ -33,3 +33,8 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
         python mytool/build_dataset.py --filelist $data --vq-root $vq_root --spk-root $spk_root --wav-root /mnt/nas1/ --output $protos_output/${data_tag}.proto
     done
 fi
+
+
+if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
+    python mytool/split_pb_file.py --input-root $protos_output --output-root $split_protos_output #--split-cnt 1024
+fi
