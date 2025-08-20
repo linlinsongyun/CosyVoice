@@ -270,9 +270,9 @@ def add_optional_chunk_mask(xs: torch.Tensor,
         print('enable_full_context', enable_full_context)
         '''
         #print('get chunk_masks all false at some timestep, force set to true, make sure they are masked in futuer computation!')
-        
-        chunk_masks[chunk_masks.sum(dim=-1) == 0] = True
+        chunk_masks[chunk_masks.sum(dim=-1) == 0] = False
         #sys.exit()
+        
     
     return chunk_masks
 
