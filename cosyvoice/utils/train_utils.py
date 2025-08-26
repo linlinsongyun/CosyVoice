@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import glob
 import logging
 import os
 import torch
@@ -22,7 +22,7 @@ import re
 import datetime
 import yaml
 
-import deepspeed
+#import deepspeed
 import torch.optim as optim
 import torch.distributed as dist
 
@@ -30,10 +30,34 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
-from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
+#from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
 
-from cosyvoice.dataset.dataset import Dataset
+
+
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
+
+
+
+#from cosyvoice.dataset.dataset import Dataset
+from cosyvoice.dataset.dataset2 import Dataset
+def init_dataset_and_dataloader_jml(args, configs, gan):
+    train_dataset = Dataset(args.train_data, data_pipeline=configs['data_pipeline'], mode='train', shuffle=True,
+                            partition=True)
+    cv_dataset = Dataset(args.cv_data, data_pipeline=configs['data_pipeline'], mode='train', shuffle=False,
+                         partition=False)
+
+    # do not use persistent_workers=True, as whisper tokenizer opens tiktoken file each time when the for loop starts
+    train_data_loader = DataLoader(train_dataset,
+                                   batch_size=None,
+                                   pin_memory=args.pin_memory if args.num_workers > 0 else False,
+                                   num_workers=args.num_workers,
+                                   prefetch_factor=args.prefetch if args.num_workers > 0 else None)
+    cv_data_loader = DataLoader(cv_dataset,
+                                batch_size=None,
+                                pin_memory=args.pin_memory if args.num_workers > 0 else False,
+                                num_workers=args.num_workers,
+                                prefetch_factor=args.prefetch if args.num_workers > 0 else None)
+    return train_dataset, cv_dataset, train_data_loader, cv_data_loader
 
 
 def init_distributed(args):
@@ -50,10 +74,10 @@ def init_distributed(args):
     return world_size, local_rank, rank
 
 
-def init_dataset_and_dataloader(args, configs, gan, dpo):
+def init_dataset_and_dataloader(args, configs, gan):
     data_pipeline = configs['data_pipeline_gan'] if gan is True else configs['data_pipeline']
-    train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, dpo=dpo, shuffle=True, partition=True)
-    cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='train', gan=gan, dpo=dpo, shuffle=False, partition=False)
+    train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, shuffle=True, partition=True)
+    cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='train', gan=gan, shuffle=False, partition=False)
 
     # do not use persistent_workers=True, as whisper tokenizer opens tiktoken file each time when the for loop starts
     train_data_loader = DataLoader(train_dataset,
@@ -69,9 +93,10 @@ def init_dataset_and_dataloader(args, configs, gan, dpo):
     return train_dataset, cv_dataset, train_data_loader, cv_data_loader
 
 
+
 def check_modify_and_save_config(args, configs):
     if args.train_engine == "torch_ddp":
-        configs['train_conf']["dtype"] = 'bf16' if args.use_amp is True else 'fp32'
+        configs['train_conf']["dtype"] = 'fp32'
     else:
         with open(args.deepspeed_config, 'r') as fin:
             ds_configs = json.load(fin)
@@ -191,6 +216,59 @@ def init_summarywriter(args):
         writer = SummaryWriter(args.tensorboard_dir)
     return writer
 
+def init_flow_cache(device):
+    encoder_cache = {'offset': 0,
+                     'pre_lookahead_layer_conv2_cache': torch.zeros(1, 512, 2).to(device),
+                     'encoders_kv_cache': torch.zeros(6, 1, 8, 0, 64 * 2).to(device),
+                     'upsample_offset': 0,
+                     'upsample_conv_cache': torch.zeros(1, 512, 4).to(self.device),
+                     'upsample_kv_cache': torch.zeros(4, 1, 8, 0, 64 * 2).to(device)}
+    decoder_cache = {'offset': 0,
+                     'down_blocks_conv_cache': torch.zeros(10, 1, 2, 832, 2).to(device),
+                     'down_blocks_kv_cache': torch.zeros(10, 1, 4, 2, 0, 512, 2).to(device),
+                     'mid_blocks_conv_cache': torch.zeros(10, 12, 2, 512, 2).to(device),
+                     'mid_blocks_kv_cache': torch.zeros(10, 12, 4, 2, 0, 512, 2).to(device),
+                     'up_blocks_conv_cache': torch.zeros(10, 1, 2, 1024, 2).to(device),
+                     'up_blocks_kv_cache': torch.zeros(10, 1, 4, 2, 0, 512, 2).to(device),
+                     'final_blocks_conv_cache': torch.zeros(10, 2, 256, 2).to(device)}
+    if self.fp16 is True:
+        for cache in [encoder_cache, decoder_cache]:
+            for k, v in cache.items():
+                if isinstance(v, torch.Tensor):
+                    cache[k] = v.half()
+    cache = {'encoder_cache': encoder_cache, 'decoder_cache': decoder_cache}
+    return cache
+    
+def model_inference(device, model, info_dict):
+    step = info_dict['step']
+    
+    mel_dir = os.path.join(info_dict['model_dir'], 'outputs/mel') 
+    wav_dir = os.path.join(info_dict['model_dir'], 'outputs/mel') 
+    os.makedirs(mel_dir, exist_ok=True)
+    os.makedirs(wav_dir, exist_ok=True)
+
+    token_dir = '/mnt/nas1/zhangying/code/valle/test_output/llama_test/speech_token'
+    emb_dir = '/mnt/nas1/zhangying/code/valle/test_output/llama_test/emb_dir/'
+    token_files = [f for f in os.listdir(token_dir) if f.endswith('.npy')]
+    selected_token_file = random.choice(npy_files)
+    token_basename = os.path.basename(selected_token_file)
+    emb_path = os.path.join(emb_dir, token_basename)
+
+    flow_cache = self.init_flow_cache()
+
+    token = torch.from_numpy(np.load(selected_token_file)).to(device)
+    token_len = torch.tensor([speech_token.size[1]], dtype=torch.int32).to(device)
+
+    embedding = torch.from_numpy(np.load(emb_path)).to(device)
+    prompt_token=torch.zeros(1, 0, dtype=torch.int32).to(device)                
+    prompt_token_len=torch.zeros(1, dtype=torch.int32).to(device)
+    prompt_feat=torch.zeros(1, 0, mel_dim).to(device)
+    prompt_feat_len=torch.zeros(1, dtype=torch.int32).to(device)
+
+    feat, _ = model.inference(token, token_len, prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, embedding, flow_cache, finalize=False)
+    mel_path = os.path.join(mel_dir, '%d_%s'%(step, token_basename))
+    np.save(mel_path, feat.detach().cpu().numpy())
+    print('saved mel_path:', mel_path)
 
 def save_model(model, model_name, info_dict):
     rank = int(os.environ.get('RANK', 0))
@@ -200,18 +278,52 @@ def save_model(model, model_name, info_dict):
     if info_dict["train_engine"] == "torch_ddp":
         if rank == 0:
             torch.save({**model.module.state_dict(), 'epoch': info_dict['epoch'], 'step': info_dict['step']}, save_model_path)
-    else:
-        with torch.no_grad():
-            model.save_checkpoint(save_dir=model_dir,
-                                  tag=model_name,
-                                  client_state=info_dict)
+
+            print('saved ', save_model_path)
+            #torch.save({'state_dict': model.modules.state_dict(),'optimizer': optimizer.state_dict()}, save_model_path)
+
+
+            #torch.save(model.module.state_dict(), save_model_path)
+            # Get all files in the model_dir that match the pattern
+            model_files = glob.glob(os.path.join(model_dir, '*.pt'))
+            print('==========pt data model_files', model_files)
+            # Sort files by modification time
+            model_files = list(filter(lambda file: 'init.pt' not in file, model_files))
+            model_files.sort(key=os.path.getmtime)
+            print('========== save model and remove model', len(model_files))
+            # Check if we have more than 5 models
+            if len(model_files) > 50:
+                oldest_model = model_files[0]
+
+
+                try:
+                    os.remove(oldest_model)
+                    os.remove(oldest_model.replace('.pt', '.yaml'))
+                    print(f"========= Deleted model file: {oldest_model}")
+
+                except FileNotFoundError:
+                    print(f"File not found, could not delete: {oldest_model}")
+                except Exception as e:
+                    print(f"An error occurred while trying to delete the file: {e}")
+                    
+        
+                    
     if rank == 0:
+
         info_path = re.sub('.pt$', '.yaml', save_model_path)
         info_dict['save_time'] = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        info_dict_new = info_dict
+        if 'loss_dict' in info_dict:
+            #print('============loss_dict', info_dict["loss_dict"]['loss'].cpu().item(), info_dict_new['grad_norm'])
+            info_dict_new['loss_dict']['loss'] = info_dict["loss_dict"]['loss'].item()  
+            #info_dict_new['grad_norm'] = info_dict["grad_norm"].item()  
+            # ============loss_dict {'loss': tensor(0.7425, device='cuda:0', grad_fn=<DivBackward0>)}
         with open(info_path, 'w') as fout:
-            data = yaml.dump(info_dict)
+            
+            data = yaml.dump(info_dict_new)
             fout.write(data)
         logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
+        #model_inference(device, model, info_dict)
 
 
 def cosyvoice_join(group_join, info_dict):
@@ -235,7 +347,7 @@ def cosyvoice_join(group_join, info_dict):
         return False
 
 
-def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None):
+def batch_forward(model, batch, scaler, info_dict):
     device = int(os.environ.get('LOCAL_RANK', 0))
 
     dtype = info_dict["dtype"]
@@ -247,30 +359,12 @@ def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None
         dtype = torch.float32
 
     if info_dict['train_engine'] == 'torch_ddp':
-        autocast = torch.cuda.amp.autocast(enabled=scaler is not None, dtype=dtype)
+        autocast = torch.cuda.amp.autocast(enabled=scaler is not None)
     else:
         autocast = torch.cuda.amp.autocast(enabled=True, dtype=dtype, cache_enabled=False)
 
     with autocast:
         info_dict['loss_dict'] = model(batch, device)
-        if ref_model is not None and dpo_loss is not None:
-            chosen_logps = info_dict['loss_dict']["chosen_logps"]
-            rejected_logps = info_dict['loss_dict']["rejected_logps"]
-            sft_loss = info_dict['loss_dict']['loss']
-            with torch.no_grad():
-                ref_loss_dict = ref_model(batch, device)
-            reference_chosen_logps = ref_loss_dict["chosen_logps"]
-            reference_rejected_logps = ref_loss_dict["rejected_logps"]
-            preference_loss, chosen_reward, reject_reward = dpo_loss(
-                chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
-            )
-            dpo_acc = (chosen_reward > reject_reward).float().mean()
-            info_dict['loss_dict']["loss"] = preference_loss + sft_loss
-            info_dict['loss_dict']["sft_loss"] = sft_loss
-            info_dict['loss_dict']["dpo_loss"] = preference_loss
-            info_dict['loss_dict']["dpo_acc"] = dpo_acc
-            info_dict['loss_dict']["chosen_reward"] = chosen_reward.mean()
-            info_dict['loss_dict']["reject_reward"] = reject_reward.mean()
     return info_dict
 
 
@@ -304,15 +398,11 @@ def update_parameter_and_lr(model, optimizer, scheduler, scaler, info_dict):
             # optimizer.step().
             if torch.isfinite(grad_norm):
                 scaler.step(optimizer)
-            else:
-                logging.warning('get infinite grad_norm, check your code/data if it appears frequently')
             scaler.update()
         else:
             grad_norm = clip_grad_norm_(model.parameters(), info_dict['grad_clip'])
             if torch.isfinite(grad_norm):
                 optimizer.step()
-            else:
-                logging.warning('get infinite grad_norm, check your code/data if it appears frequently')
         optimizer.zero_grad()
         scheduler.step()
     info_dict["lr"] = optimizer.param_groups[0]['lr']
@@ -358,7 +448,7 @@ def log_per_save(writer, info_dict):
     rank = int(os.environ.get('RANK', 0))
     logging.info(
         'Epoch {} Step {} CV info lr {} {} rank {}'.format(
-            epoch, step + 1, lr, rank, ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()])))
+            epoch, step + 1, lr, rank, ' '.join(['{}_{}'.format(k, v) for k, v in loss_dict.items()])))
 
     if writer is not None:
         for k in ['epoch', 'lr']:
