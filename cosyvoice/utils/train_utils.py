@@ -314,10 +314,17 @@ def save_model(model, model_name, info_dict):
         info_dict['save_time'] = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
         info_dict_new = info_dict
         if 'loss_dict' in info_dict:
-            #print('============loss_dict', info_dict["loss_dict"]['loss'].cpu().item(), info_dict_new['grad_norm'])
-            info_dict_new['loss_dict']['loss'] = info_dict["loss_dict"]['loss'].item()  
-            #info_dict_new['grad_norm'] = info_dict["grad_norm"].item()  
-            # ============loss_dict {'loss': tensor(0.7425, device='cuda:0', grad_fn=<DivBackward0>)}
+            loss_value = info_dict["loss_dict"]['loss']
+
+            try:
+                # 尝试调用 .item()。如果 loss_value 是一个 Tensor 对象，这会成功执行。
+                info_dict_new['loss_dict']['loss'] = loss_value.item()
+            except AttributeError:
+                # 如果 loss_value 只是一个普通的 float，上面的代码会触发 AttributeError。
+                # 我们在这里捕获这个异常，并直接进行赋值。
+                info_dict_new['loss_dict']['loss'] = loss_value
+    
+
         with open(info_path, 'w') as fout:
             
             data = yaml.dump(info_dict_new)
