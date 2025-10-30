@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from typing import List
 import random
 import sys
 import librosa
@@ -619,6 +620,158 @@ def padding(data, use_spk_embedding, mode='train', gan=False):
             # only gan train needs speech, delete it to save memory
             del batch["speech"]
             del batch["speech_len"]
+        if mode == 'inference':
+            tts_text = [sample[i]['tts_text'] for i in order]
+            tts_index = [sample[i]['tts_index'] for i in order]
+            tts_text_token = [torch.tensor(sample[i]['tts_text_token']) for i in order]
+            tts_text_token_len = torch.tensor([i.size(0) for i in tts_text_token], dtype=torch.int32)
+            tts_text_token = pad_sequence(tts_text_token, batch_first=True, padding_value=-1)
+            batch.update({'tts_text': tts_text,
+                          'tts_index': tts_index,
+                          'tts_text_token': tts_text_token,
+                          'tts_text_token_len': tts_text_token_len})
+        if use_spk_embedding is True:
+            batch["embedding"] = batch["spk_embedding"]
+        else:
+            batch["embedding"] = batch["utt_embedding"]
+        yield batch
+
+      
+def pad_or_truncate_list(tensor_list: List[torch.Tensor], target_length: int, padding_value: float = 0.0) -> torch.Tensor:
+    """
+    将一个张量列表中的每个张量填充或截断到指定长度，然后堆叠成一个批处理张量。
+    """
+    processed_list = []
+    for tensor in tensor_list:
+        current_length = tensor.shape[-1]
+        
+        if current_length > target_length:
+            # 截断
+            processed_tensor = tensor[..., :target_length]
+        elif current_length < target_length:
+            # 填充
+            pad_needed = target_length - current_length
+            processed_tensor = F.pad(tensor, (0, pad_needed), 'constant', padding_value)
+        else:
+            processed_tensor = tensor
+            
+        processed_list.append(processed_tensor)
+        
+    return torch.stack(processed_list, dim=0)
+   
+def padding_with_audio_samples(data, use_spk_embedding, mode='train', gan=False, n_times=960):
+    """ Padding the data into training data
+
+        Args:
+            data: Iterable[List[{key, feat, label}]]
+
+        Returns:
+            Iterable[Tuple(keys, feats, labels, feats lengths, label lengths)]
+    """
+    
+    for sample in data:
+        assert isinstance(sample, list)
+        speech_feat_len = torch.tensor([x['speech_feat'].size(1) for x in sample],
+                                       dtype=torch.int32)
+        order = torch.argsort(speech_feat_len, descending=True) # 从大到小的index
+
+        utts = [sample[i]['utt'] for i in order]
+        speech = [sample[i]['speech'].squeeze(dim=0) for i in order]
+        speech_len = torch.tensor([i.size(0) for i in speech], dtype=torch.int32)
+        max_speech_len = max(speech_len)
+        pad_data_len = n_times - max_speech_len%n_times
+        max_ntimes_speech_len = max_speech_len + pad_data_len
+        speech = pad_or_truncate_list(speech, max_ntimes_speech_len)
+        #speech = pad_sequence(speech, batch_first=True, padding_value=0)
+        
+        speech_token = [torch.tensor(sample[i]['speech_token']) for i in order]
+        #print('speech_token', speech_token[0].shape)
+        speech_token_len = torch.tensor([i.size(0) for i in speech_token], dtype=torch.int32)
+        max_token_len = max(speech_token_len)
+        expected_len_from_speech = max_ntimes_speech_len // 960
+        # wav_pad 之后会比token 长
+        if max_token_len != expected_len_from_speech:
+            padding_tensor = torch.tensor([0], device=speech_token[0].device, dtype=speech_token[0].dtype)
+            speech_token[0] = torch.cat((speech_token[0], padding_tensor), dim=0)
+            speech_token_len[0] = speech_token_len[0]+1
+            
+        speech_token = pad_sequence(speech_token,
+                                    batch_first=True,
+                                    padding_value=0)
+        
+
+
+
+        speech_feat = [sample[i]['speech_feat'] for i in order]
+        speech_feat_len = torch.tensor([i.size(0) for i in speech_feat], dtype=torch.int32)
+        
+        speech_feat = pad_sequence(speech_feat,
+                                       batch_first=True,
+                                       padding_value=0)
+        #except:
+        #    original_lengths = [feat.size(0) for feat in speech_feat]
+        #    print("原始样本长度:", original_lengths)
+        #    original_dims = [feat.size(1) for feat in speech_feat]
+        #    print("填充后统一长度:", original_dims)
+
+            
+        text = [sample[i]['text'] for i in order]
+        text_token = [torch.tensor(sample[i]['text_token']) for i in order]
+        text_token_len = torch.tensor([i.size(0) for i in text_token], dtype=torch.int32)
+        text_token = pad_sequence(text_token, batch_first=True, padding_value=0)
+        utt_embedding = torch.stack([sample[i]['utt_embedding'] for i in order], dim=0)
+        spk_embedding = torch.stack([sample[i]['spk_embedding'] for i in order], dim=0)
+        batch = {
+            "utts": utts,
+            "speech": speech,
+            "speech_len": speech_len,
+            "speech_token": speech_token,
+            "speech_token_len": speech_token_len,
+            "speech_feat": speech_feat,
+            "speech_feat_len": speech_feat_len,
+            "text": text,
+            "text_token": text_token,
+            "text_token_len": text_token_len,
+            "utt_embedding": utt_embedding,
+            "spk_embedding": spk_embedding,
+        }
+        #print('=========================padding_with_audio_samples')
+        #utts
+        # speech_token
+        # speech_token_len
+        # speech_feat
+        # speech_feat_len
+        # text
+        # text_token
+        # text_token_len
+        # utt_embedding
+        # spk_embedding
+        # embedding
+
+        if gan is True:
+            # in gan train, we need pitch_feat
+            pitch_feat = [sample[i]['pitch_feat'] for i in order]
+            pitch_feat_len = torch.tensor([i.size(0) for i in pitch_feat], dtype=torch.int32)
+            pitch_feat = pad_sequence(pitch_feat,
+                                      batch_first=True,
+                                      padding_value=0)
+            batch["pitch_feat"] = pitch_feat
+            batch["pitch_feat_len"] = pitch_feat_len
+        else:
+            # only gan train needs speech, delete it to save memory
+            #=============speech_feat torch.Size([2, 188, 80])
+            #=============padding_with_audio_samples speech[0] torch.Size([181104])
+
+            #print('=============speech_feat', batch["speech_feat"].shape)
+            pass
+            # vae del
+            # del batch["speech_feat"]
+            # del batch["speech_feat_len"]
+            #print('=============padding_with_audio_samples speech[0]', speech[0].shape)
+            # pad speech : torch.Size([2, 181104])
+            #print('pad speech :', batch["speech"].shape)
+
+            
         if mode == 'inference':
             tts_text = [sample[i]['tts_text'] for i in order]
             tts_index = [sample[i]['tts_index'] for i in order]
