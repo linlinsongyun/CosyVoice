@@ -38,7 +38,7 @@ llm: !new:cosyvoice.llm.llm.Qwen2LM
         top_k: 25
         win_size: 10
         tau_r: 0.1
-output_dim: 64 
+output_dim: 80
 flow: !new:cosyvoice.flow.flow.CausalMaskedDiffWithXvec
     input_size: 512
     output_size: !ref <output_dim>        
